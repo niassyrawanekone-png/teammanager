@@ -77,7 +77,10 @@ class ChangementMotDePasseSchema(BaseModel):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "https://teammanager-frontend-zeta.vercel.app"],
+    allow_origins=[
+        "http://localhost:5173",
+        "https://teammanager-frontend-zeta.vercel.app"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -140,11 +143,11 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
 
 # --- PROFIL DE L'UTILISATEUR CONNECTÉ ---
 
-@app.get("/api/me", response_model=UserResponse)
+@app.get("/me", response_model=UserResponse)
 def lire_mon_profil(current_user: UtilisateurDB = Depends(get_current_user)):
     return current_user
 
-@app.put("/api/me/nom")
+@app.put("/me/nom")
 def modifier_nom(
     data: ChangementNomSchema, 
     db: Session = Depends(get_db), 
@@ -155,13 +158,12 @@ def modifier_nom(
     db.refresh(current_user)
     return {"message": "Nom mis à jour avec succès", "nom": current_user.nom}
 
-@app.put("/api/me/mot-de-passe")
+@app.put("/me/mot-de-passe")
 def modifier_mot_de_passe(
     data: ChangementMotDePasseSchema, 
     db: Session = Depends(get_db), 
     current_user: UtilisateurDB = Depends(get_current_user)
 ):
-    # Correction : utilisation de current_user.hashed_password
     if not verify_password(data.ancien_mot_de_passe, current_user.hashed_password):
         raise HTTPException(status_code=400, detail="L'actuel mot de passe est incorrect.")
     
@@ -171,18 +173,18 @@ def modifier_mot_de_passe(
 
 # --- ENDPOINTS UTILISATEURS ---
 
-@app.get("/api/utilisateurs/", response_model=List[UserResponse])
+@app.get("/utilisateurs/", response_model=List[UserResponse])
 def lire_utilisateurs(db: Session = Depends(get_db)):
     return db.query(UtilisateurDB).all()
 
-@app.get("/api/utilisateurs/{user_id}", response_model=UserResponse)
+@app.get("/utilisateurs/{user_id}", response_model=UserResponse)
 def lire_un_utilisateur(user_id: int, db: Session = Depends(get_db)):
     user_db = db.query(UtilisateurDB).filter(UtilisateurDB.id == user_id).first()
     if not user_db:
         raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
     return user_db
 
-@app.post("/api/utilisateurs/", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+@app.post("/utilisateurs/", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 def creer_utilisateur(
     donnees: UserCreate, 
     db: Session = Depends(get_db), 
@@ -207,7 +209,7 @@ def creer_utilisateur(
     db.refresh(nouvel_utilisateur)
     return nouvel_utilisateur
 
-@app.put("/api/utilisateurs/{user_id}", response_model=UserResponse)
+@app.put("/utilisateurs/{user_id}", response_model=UserResponse)
 def modifier_utilisateur(
     user_id: int, 
     donnees: UserUpdate, 
@@ -229,7 +231,7 @@ def modifier_utilisateur(
     db.refresh(user_db)
     return user_db
 
-@app.delete("/api/utilisateurs/{user_id}")
+@app.delete("/utilisateurs/{user_id}")
 def delete_utilisateur(
     user_id: int, 
     db: Session = Depends(get_db),
@@ -244,11 +246,11 @@ def delete_utilisateur(
 
 # --- ENDPOINTS PROJETS ---
 
-@app.get("/api/projets/", response_model=List[ProjetResponse])
+@app.get("/projets/", response_model=List[ProjetResponse])
 def lire_projets(db: Session = Depends(get_db)):
     return db.query(ProjetDB).all()
 
-@app.post("/api/projets/", response_model=ProjetResponse, status_code=status.HTTP_201_CREATED)
+@app.post("/projets/", response_model=ProjetResponse, status_code=status.HTTP_201_CREATED)
 def creer_projet(
     donnees: ProjetCreate, 
     db: Session = Depends(get_db),
@@ -265,7 +267,7 @@ def creer_projet(
     db.refresh(nouveau_projet)
     return nouveau_projet
 
-@app.put("/api/projets/{projet_id}", response_model=ProjetResponse)
+@app.put("/projets/{projet_id}", response_model=ProjetResponse)
 def modifier_projet(
     projet_id: int, 
     donnees: ProjetUpdate, 
@@ -289,7 +291,7 @@ def modifier_projet(
     db.refresh(projet_db)
     return projet_db
 
-@app.delete("/api/projets/{projet_id}")
+@app.delete("/projets/{projet_id}")
 def supprimer_projet(
     projet_id: int, 
     db: Session = Depends(get_db),
