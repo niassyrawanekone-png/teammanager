@@ -77,7 +77,7 @@ class ChangementMotDePasseSchema(BaseModel):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://teammanager-frontend-zeta.vercal.app"],
+    allow_origins=["https://teammanager-frontend-zeta.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
