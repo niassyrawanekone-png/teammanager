@@ -1,41 +1,66 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Optional
-
-from fastapi import FastAPI, HTTPException, Depends, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
-from sqlalchemy.orm import Session
-from jose import JWTError, jwt
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text
+from sqlalchemy.orm import Session, relationship
 
-from database import get_db, UtilisateurDB, ProjetDB
-from security import hash_password, verify_password, create_access_token, SECRET_KEY, ALGORITHM
+import database
+import security
+from database import engine, get_db
 
-app = FastAPI(title="TeamManager API")
+# Création des tables additionnelles (comme les messages de partage)
+from sqlalchemy.ext.declarative import declarative_base
+Base = database.Base
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+class MessagePartageDB(Base):
+    __tablename__ = "messages_partage"
 
-# --- SCHÉMAS PYDANTIC ---
+    id = Column(Integer, primary_key=True, index=True)
+    contenu = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    user_id = Column(Integer, ForeignKey("utilisateurs.id"))
 
-class UserCreate(BaseModel):
-    email: EmailStr
-    password: Optional[str] = "123456"
-    nom: str
-    role: Optional[str] = "Membre"
+Base.metadata.create_all(bind=engine)
 
-class UserUpdate(BaseModel):
+app = FastAPI(title="TeamManager API", version="1.0.0")
+
+# ================= MIDDLEWARE CORS =================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Autorise toutes les origines (Vercel, localhost, etc.)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ================= SCHÉMAS PYDANTIC =================
+
+class UtilisateurCreate(BaseModel):
     nom: Optional[str] = None
-    email: Optional[EmailStr] = None
-    role: Optional[str] = None
+    email: EmailStr
+    password: str
 
-class UserResponse(BaseModel):
+class UtilisateurOut(BaseModel):
     id: int
-    nom: str
-    email: str
+    nom: Optional[str] = None
+    email: EmailStr
     role: str
 
     class Config:
         from_attributes = True
+
+class NomUpdate(BaseModel):
+    nom: str
+
+class PasswordUpdate(BaseModel):
+    ancien_mot_de_passe: str
+    nouveau_mot_de_passe: str
+
+class RoleUpdate(BaseModel):
+    role: str
 
 class ProjetCreate(BaseModel):
     titre: str
@@ -43,260 +68,309 @@ class ProjetCreate(BaseModel):
     statut: Optional[str] = "En cours"
     responsable: Optional[str] = "Non assigné"
 
-class ProjetUpdate(BaseModel):
-    titre: Optional[str] = None
-    description: Optional[str] = None
-    statut: Optional[str] = None
-    responsable: Optional[str] = None
-
-class ProjetResponse(BaseModel):
+class ProjetOut(BaseModel):
     id: int
     titre: str
-    description: str
+    description: Optional[str] = ""
     statut: str
     responsable: str
 
     class Config:
         from_attributes = True
 
-class Token(BaseModel):
-    access_token: str
-    token_type: str
+class MessageCreate(BaseModel):
+    contenu: str
 
-class TokenData(BaseModel):
-    email: Optional[str] = None
+class MessageOut(BaseModel):
+    id: int
+    contenu: str
+    created_at: datetime
+    auteur_nom: str
 
-class ChangementNomSchema(BaseModel):
-    nom: str
+    class Config:
+        from_attributes = True
 
-class ChangementMotDePasseSchema(BaseModel):
-    ancien_mot_de_passe: str
-    nouveau_mot_de_passe: str
 
-# --- MIDDLEWARE CORS ---
+# ================= ROUTES AUTHENTIFICATION =================
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://teammanager-frontend-zeta.vercel.app"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- DÉPENDANCE DE SÉCURITÉ ---
-
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Impossible de valider les identifiants.",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        if email is None:
-            raise credentials_exception
-        token_data = TokenData(email=email)
-    except JWTError:
-        raise credentials_exception
-
-    user = db.query(UtilisateurDB).filter(UtilisateurDB.email == token_data.email).first()
-    if user is None:
-        raise credentials_exception
-    return user
-
-# --- AUTHENTIFICATION ---
-
-@app.post("/register", status_code=status.HTTP_201_CREATED)
-def register(user: UserCreate, db: Session = Depends(get_db)):
-    db_user = db.query(UtilisateurDB).filter(UtilisateurDB.email == user.email).first()
+@app.post("/register", response_model=UtilisateurOut, status_code=status.HTTP_201_CREATED)
+def inscrire(user: UtilisateurCreate, db: Session = Depends(get_db)):
+    email_clean = user.email.lower().strip()
+    db_user = db.query(database.UtilisateurDB).filter(database.UtilisateurDB.email == email_clean).first()
     if db_user:
-        raise HTTPException(status_code=400, detail="Cet email est déjà utilisé.")
+        raise HTTPException(status_code=400, detail="Cet e-mail est déjà utilisé.")
     
-    hashed_pwd = hash_password(user.password or "123456")
-    nouvel_utilisateur = UtilisateurDB(
-        email=user.email,
-        nom=user.nom,
-        hashed_password=hashed_pwd,
-        role=user.role
+    hashed = security.hash_password(user.password)
+    
+    # Rôle attribué automatiquement : SUPER_ADMIN si votre adresse email, sinon Membre
+    role_initial = "SUPER_ADMIN" if email_clean == "niassyrawanekone@gmail.com" else "Membre"
+    
+    nouveau_user = database.UtilisateurDB(
+        nom=user.nom, 
+        email=email_clean, 
+        hashed_password=hashed, 
+        role=role_initial
     )
-    db.add(nouvel_utilisateur)
+    db.add(nouveau_user)
     db.commit()
-    db.refresh(nouvel_utilisateur)
-    return {"message": "Utilisateur créé avec succès !"}
+    db.refresh(nouveau_user)
+    return nouveau_user
 
-@app.post("/login", response_model=Token)
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = db.query(UtilisateurDB).filter(UtilisateurDB.email == form_data.username).first()
-    if not user or not verify_password(form_data.password, user.hashed_password):
+
+@app.post("/login")
+def connecter(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    email_clean = form_data.username.lower().strip()
+    
+    # 1. Vérification spécifique du Super Admin
+    if email_clean == "niassyrawanekone@gmail.com":
+        if form_data.password != "niassy191006":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="E-mail ou mot de passe incorrect.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        # Vérifie si l'utilisateur existe déjà en BD, sinon on le crée / met à jour avec le rôle SUPER_ADMIN
+        admin_user = db.query(database.UtilisateurDB).filter(database.UtilisateurDB.email == email_clean).first()
+        if not admin_user:
+            hashed = security.hash_password("niassy191006")
+            admin_user = database.UtilisateurDB(
+                nom="Rawane Koné Niassy", 
+                email=email_clean, 
+                hashed_password=hashed, 
+                role="SUPER_ADMIN"
+            )
+            db.add(admin_user)
+            db.commit()
+            db.refresh(admin_user)
+        elif admin_user.role != "SUPER_ADMIN":
+            admin_user.role = "SUPER_ADMIN"
+            db.commit()
+
+        access_token = security.create_access_token(data={"sub": email_clean})
+        return {"access_token": access_token, "token_type": "bearer"}
+
+    # 2. Connexion classique pour les autres utilisateurs
+    user = db.query(database.UtilisateurDB).filter(database.UtilisateurDB.email == email_clean).first()
+    if not user or not security.verify_password(form_data.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Email ou mot de passe incorrect.",
+            detail="E-mail ou mot de passe incorrect.",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
-    access_token = create_access_token(data={"sub": user.email})
+    access_token = security.create_access_token(data={"sub": user.email})
     return {"access_token": access_token, "token_type": "bearer"}
 
-# --- PROFIL DE L'UTILISATEUR CONNECTÉ ---
 
-@app.get("/me", response_model=UserResponse)
-def lire_mon_profil(current_user: UtilisateurDB = Depends(get_current_user)):
+@app.get("/me", response_model=UtilisateurOut)
+def obtenir_profil(current_user: database.UtilisateurDB = Depends(security.get_current_user)):
     return current_user
 
-@app.put("/me/nom")
-def modifier_nom(
-    data: ChangementNomSchema, 
-    db: Session = Depends(get_db), 
-    current_user: UtilisateurDB = Depends(get_current_user)
+
+@app.put("/me/nom", response_model=UtilisateurOut)
+def modifier_mon_nom(
+    data: NomUpdate,
+    db: Session = Depends(get_db),
+    current_user: database.UtilisateurDB = Depends(security.get_current_user)
 ):
     current_user.nom = data.nom
     db.commit()
     db.refresh(current_user)
-    return {"message": "Nom mis à jour avec succès", "nom": current_user.nom}
+    return current_user
+
 
 @app.put("/me/mot-de-passe")
-def modifier_mot_de_passe(
-    data: ChangementMotDePasseSchema, 
-    db: Session = Depends(get_db), 
-    current_user: UtilisateurDB = Depends(get_current_user)
+def modifier_mon_mot_de_passe(
+    data: PasswordUpdate,
+    db: Session = Depends(get_db),
+    current_user: database.UtilisateurDB = Depends(security.get_current_user)
 ):
-    if not verify_password(data.ancien_mot_de_passe, current_user.hashed_password):
-        raise HTTPException(status_code=400, detail="L'actuel mot de passe est incorrect.")
+    if not security.verify_password(data.ancien_mot_de_passe, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="L'ancien mot de passe est incorrect.")
     
-    current_user.hashed_password = hash_password(data.nouveau_mot_de_passe)
+    current_user.hashed_password = security.hash_password(data.nouveau_mot_de_passe)
     db.commit()
-    return {"message": "Mot de passe modifié avec succès"}
+    return {"message": "Mot de passe mis à jour avec succès."}
 
-# --- ENDPOINTS UTILISATEURS ---
 
-@app.get("/utilisateurs/", response_model=List[UserResponse])
-def lire_utilisateurs(db: Session = Depends(get_db)):
-    return db.query(UtilisateurDB).all()
+# ================= ROUTES UTILISATEURS =================
 
-@app.get("/utilisateurs/{user_id}", response_model=UserResponse)
-def lire_un_utilisateur(user_id: int, db: Session = Depends(get_db)):
-    user_db = db.query(UtilisateurDB).filter(UtilisateurDB.id == user_id).first()
-    if not user_db:
-        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
-    return user_db
-
-@app.post("/utilisateurs/", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-def creer_utilisateur(
-    donnees: UserCreate, 
-    db: Session = Depends(get_db), 
-    current_user: UtilisateurDB = Depends(get_current_user)
-):
-    utilisateur_existant = db.query(UtilisateurDB).filter(UtilisateurDB.email == donnees.email).first()
-    if utilisateur_existant:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, 
-            detail="Cet email est déjà attribué à un autre membre."
-        )
-
-    mot_de_passe_hache = hash_password(donnees.password or "123456")
-    nouvel_utilisateur = UtilisateurDB(
-        nom=donnees.nom,
-        email=donnees.email,
-        role=donnees.role,
-        hashed_password=mot_de_passe_hache
-    )
-    db.add(nouvel_utilisateur)
-    db.commit()
-    db.refresh(nouvel_utilisateur)
-    return nouvel_utilisateur
-
-@app.put("/utilisateurs/{user_id}", response_model=UserResponse)
-def modifier_utilisateur(
-    user_id: int, 
-    donnees: UserUpdate, 
+@app.get("/utilisateurs/", response_model=List[UtilisateurOut])
+def lister_utilisateurs(
     db: Session = Depends(get_db),
-    current_user: UtilisateurDB = Depends(get_current_user)
+    current_user: database.UtilisateurDB = Depends(security.get_current_user)
 ):
-    user_db = db.query(UtilisateurDB).filter(UtilisateurDB.id == user_id).first()
-    if not user_db:
-        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
+    return db.query(database.UtilisateurDB).all()
+
+
+@app.post("/utilisateurs/", response_model=UtilisateurOut, status_code=status.HTTP_201_CREATED)
+def ajouter_utilisateur(
+    user: UtilisateurCreate,
+    db: Session = Depends(get_db),
+    current_user: database.UtilisateurDB = Depends(security.get_current_user)
+):
+    email_clean = user.email.lower().strip()
+    db_user = db.query(database.UtilisateurDB).filter(database.UtilisateurDB.email == email_clean).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Cet utilisateur existe déjà.")
     
-    if donnees.role is not None:
-        user_db.role = donnees.role
-    if donnees.nom is not None:
-        user_db.nom = donnees.nom
-    if donnees.email is not None:
-        user_db.email = donnees.email
-        
+    hashed = security.hash_password(user.password)
+    nouveau_user = database.UtilisateurDB(nom=user.nom, email=email_clean, hashed_password=hashed, role="Membre")
+    db.add(nouveau_user)
     db.commit()
-    db.refresh(user_db)
-    return user_db
+    db.refresh(nouveau_user)
+    return nouveau_user
 
-@app.delete("/utilisateurs/{user_id}")
-def delete_utilisateur(
-    user_id: int, 
+
+@app.put("/utilisateurs/{user_id}", response_model=UtilisateurOut)
+def modifier_role(
+    user_id: int,
+    data: RoleUpdate,
     db: Session = Depends(get_db),
-    current_user: UtilisateurDB = Depends(get_current_user)
+    current_user: database.UtilisateurDB = Depends(security.get_current_user)
 ):
-    user_db = db.query(UtilisateurDB).filter(UtilisateurDB.id == user_id).first()
-    if not user_db:
-        raise HTTPException(status_code=404, detail="Utilisateur introuvable")
-    db.delete(user_db)
+    target_user = db.query(database.UtilisateurDB).filter(database.UtilisateurDB.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="Utilisateur non trouvé.")
+    
+    target_user.role = data.role
     db.commit()
-    return {"message": "Utilisateur supprimé"}
+    db.refresh(target_user)
+    return target_user
 
-# --- ENDPOINTS PROJETS ---
 
-@app.get("/projets/", response_model=List[ProjetResponse])
-def lire_projets(db: Session = Depends(get_db)):
-    return db.query(ProjetDB).all()
-
-@app.post("/projets/", response_model=ProjetResponse, status_code=status.HTTP_201_CREATED)
-def creer_projet(
-    donnees: ProjetCreate, 
+@app.delete("/utilisateurs/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def supprimer_utilisateur(
+    user_id: int,
     db: Session = Depends(get_db),
-    current_user: UtilisateurDB = Depends(get_current_user)
+    current_user: database.UtilisateurDB = Depends(security.get_current_user)
 ):
-    nouveau_projet = ProjetDB(
-        titre=donnees.titre,
-        description=donnees.description,
-        statut=donnees.statut,
-        responsable=donnees.responsable
+    target_user = db.query(database.UtilisateurDB).filter(database.UtilisateurDB.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="Utilisateur non trouvé.")
+    
+    db.delete(target_user)
+    db.commit()
+    return None
+
+
+# ================= ROUTES PROJETS =================
+
+@app.get("/projets/", response_model=List[ProjetOut])
+def lister_projets(
+    db: Session = Depends(get_db),
+    current_user: database.UtilisateurDB = Depends(security.get_current_user)
+):
+    return db.query(database.ProjetDB).all()
+
+
+@app.post("/projets/", response_model=ProjetOut, status_code=status.HTTP_201_CREATED)
+def ajouter_projet(
+    projet: ProjetCreate,
+    db: Session = Depends(get_db),
+    current_user: database.UtilisateurDB = Depends(security.get_current_user)
+):
+    nouveau_projet = database.ProjetDB(
+        titre=projet.titre, 
+        description=projet.description, 
+        statut=projet.statut,
+        responsable=projet.responsable
     )
     db.add(nouveau_projet)
     db.commit()
     db.refresh(nouveau_projet)
     return nouveau_projet
 
-@app.put("/projets/{projet_id}", response_model=ProjetResponse)
-def modifier_projet(
-    projet_id: int, 
-    donnees: ProjetUpdate, 
-    db: Session = Depends(get_db),
-    current_user: UtilisateurDB = Depends(get_current_user)
-):
-    projet_db = db.query(ProjetDB).filter(ProjetDB.id == projet_id).first()
-    if not projet_db:
-        raise HTTPException(status_code=404, detail="Projet non trouvé")
-    
-    if donnees.statut is not None:
-        projet_db.statut = donnees.statut
-    if donnees.titre is not None:
-        projet_db.titre = donnees.titre
-    if donnees.description is not None:
-        projet_db.description = donnees.description
-    if donnees.responsable is not None:
-        projet_db.responsable = donnees.responsable
-        
-    db.commit()
-    db.refresh(projet_db)
-    return projet_db
 
-@app.delete("/projets/{projet_id}")
-def supprimer_projet(
-    projet_id: int, 
+@app.put("/projets/{projet_id}", response_model=ProjetOut)
+def modifier_projet(
+    projet_id: int,
+    projet: ProjetCreate,
     db: Session = Depends(get_db),
-    current_user: UtilisateurDB = Depends(get_current_user)
+    current_user: database.UtilisateurDB = Depends(security.get_current_user)
 ):
-    projet_db = db.query(ProjetDB).filter(ProjetDB.id == projet_id).first()
-    if not projet_db:
-        raise HTTPException(status_code=404, detail="Projet introuvable")
-    db.delete(projet_db)
+    p = db.query(database.ProjetDB).filter(database.ProjetDB.id == projet_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Projet non trouvé.")
+    
+    p.titre = projet.titre
+    p.description = projet.description
+    p.statut = projet.statut
+    p.responsable = projet.responsable
     db.commit()
-    return {"message": "Projet supprimé"}
+    db.refresh(p)
+    return p
+
+
+@app.delete("/projets/{projet_id}", status_code=status.HTTP_204_NO_CONTENT)
+def supprimer_projet(
+    projet_id: int,
+    db: Session = Depends(get_db),
+    current_user: database.UtilisateurDB = Depends(security.get_current_user)
+):
+    p = db.query(database.ProjetDB).filter(database.ProjetDB.id == projet_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Projet non trouvé.")
+    
+    db.delete(p)
+    db.commit()
+    return None
+
+
+# ================= ROUTES ESPACE DE PARTAGE =================
+
+@app.get("/partage/", response_model=List[MessageOut])
+def lister_messages_partage(
+    db: Session = Depends(get_db),
+    current_user: database.UtilisateurDB = Depends(security.get_current_user)
+):
+    messages = db.query(MessagePartageDB).order_by(MessagePartageDB.created_at.desc()).all()
+    resultat = []
+    for msg in messages:
+        auteur = db.query(database.UtilisateurDB).filter(database.UtilisateurDB.id == msg.user_id).first()
+        nom_auteur = auteur.nom if (auteur and auteur.nom) else (auteur.email if auteur else "Inconnu")
+        resultat.append({
+            "id": msg.id,
+            "contenu": msg.contenu,
+            "created_at": msg.created_at,
+            "auteur_nom": nom_auteur
+        })
+    return resultat
+
+
+@app.post("/partage/", response_model=MessageOut, status_code=status.HTTP_201_CREATED)
+def publier_message_partage(
+    msg: MessageCreate,
+    db: Session = Depends(get_db),
+    current_user: database.UtilisateurDB = Depends(security.get_current_user)
+):
+    nouveau_msg = MessagePartageDB(contenu=msg.contenu, user_id=current_user.id)
+    db.add(nouveau_msg)
+    db.commit()
+    db.refresh(nouveau_msg)
+
+    nom_auteur = current_user.nom if current_user.nom else current_user.email
+    return {
+        "id": nouveau_msg.id,
+        "contenu": nouveau_msg.contenu,
+        "created_at": nouveau_msg.created_at,
+        "auteur_nom": nom_auteur
+    }
+
+
+@app.delete("/partage/{message_id}", status_code=status.HTTP_204_NO_CONTENT)
+def supprimer_message_partage(
+    message_id: int,
+    db: Session = Depends(get_db),
+    current_user: database.UtilisateurDB = Depends(security.get_current_user)
+):
+    msg = db.query(MessagePartageDB).filter(MessagePartageDB.id == message_id).first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message non trouvé.")
+    
+    if msg.user_id != current_user.id and current_user.role not in ["Admin", "SUPER_ADMIN"]:
+        raise HTTPException(status_code=403, detail="Vous n'avez pas la permission de supprimer ce message.")
+    
+    db.delete(msg)
+    db.commit()
+    return None
