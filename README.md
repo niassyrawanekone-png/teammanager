@@ -4,7 +4,7 @@
 
 Configure these values in the backend hosting environment; do not commit secrets:
 
-- `DATABASE_URL`: existing persistent database URL. The default is `sqlite:///./database.db`.
+- `DATABASE_URL`: persistent database URL. The default is `sqlite:///./database.db` for local SQLite development. Render PostgreSQL URLs using `postgres://` or `postgresql://` are normalized to the Psycopg 3 SQLAlchemy driver.
 - `JWT_SECRET_KEY`: use the current signing secret to preserve unexpired sessions; provide at least 32 characters.
 - `SUPER_ADMIN_EMAIL`: owner email used only for the one-time bootstrap when no super-administrator account exists. Set it in hosting configuration; there is no source-code default.
 - `SUPER_ADMIN_PASSWORD`: one-time bootstrap password used only when no super-administrator account exists. It is stored as a bcrypt hash and cannot reset an existing account at login.
@@ -27,7 +27,7 @@ There is no public HTTP endpoint for owner recovery. A server operator with auth
 
 ## Workspace migration
 
-Make a backup of the database file first. From this directory, run:
+The initializer creates missing model tables, then applies explicit, repeatable legacy-column, workspace-backfill, and index steps; `create_all()` alone is not treated as an upgrade for existing schemas. SQLite and PostgreSQL are supported. Before applying it to an existing database, make and verify a restorable backup. From this directory, run one of the scripts:
 
 ```powershell
 python migrations/001_workspaces.py
@@ -41,7 +41,7 @@ python migrations/002_collaboration.py
 python migrations/003_single_super_admin.py
 ```
 
-Migrations `0001_workspaces`, `0002_collaboration`, and `0003_single_super_admin` are additive and repeatable. They preserve existing users, project IDs, messages, password hashes, and project descriptions. Migration `0003` creates a unique SQLite index and fails if more than one super administrator already exists; inspect and resolve that data only after a backup. No database reset is used.
+The scripts `001_workspaces.py`, `002_collaboration.py`, and `003_single_super_admin.py` all call the shared idempotent initializer. It records revisions `0001_workspaces`, `0002_collaboration`, and `0003_single_super_admin`. The initializer preserves existing user IDs, password hashes, project IDs, and messages; legacy role labels and workspace ownership are normalized/backfilled as part of the existing migration behavior. It checks for multiple super-administrator candidates before schema or account changes and aborts without changing roles or accounts if duplicates exist. The final expression-based unique index is compiled for SQLite or PostgreSQL. No database reset is used.
 
 Run the migration before deploying the new API code. The backend startup currently calls the same schema initializer, so starting the API also attempts this index creation. Do not start it against a production database until its backup is verified and the existing super-admin count has been checked.
 

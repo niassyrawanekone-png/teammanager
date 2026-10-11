@@ -3,13 +3,16 @@ import sys
 import unittest
 import asyncio
 from io import BytesIO
+from types import SimpleNamespace
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "site-packages"))
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.schema import CreateTable
 from fastapi import HTTPException
 from starlette.datastructures import Headers, UploadFile
 from starlette.requests import Request
@@ -18,6 +21,130 @@ from scripts.recover_super_admin import recover_super_admin_password
 
 import database
 import main
+
+
+class DatabaseDialectTests(unittest.TestCase):
+    def test_render_postgres_urls_select_psycopg_three(self):
+        for value in (
+            "postgres://db-user:placeholder@db.example/team_manager",
+            "postgresql://db-user:placeholder@db.example/team_manager",
+        ):
+            normalized = database._normalize_database_url(value)
+            self.assertEqual(normalized.drivername, "postgresql+psycopg")
+            self.assertEqual(normalized.host, "db.example")
+            self.assertEqual(normalized.database, "team_manager")
+            self.assertEqual(normalized.password, "placeholder")
+
+    def test_psycopg_engine_can_be_constructed_without_connecting(self):
+        engine = create_engine(database._normalize_database_url("postgresql://db.example/team_manager"))
+        try:
+            self.assertEqual(engine.dialect.name, "postgresql")
+            self.assertEqual(engine.dialect.driver, "psycopg")
+        finally:
+            engine.dispose()
+
+    def test_sqlite_fallback_and_psycopg_specific_urls_are_preserved(self):
+        fallback = database._normalize_database_url("sqlite:///./database.db")
+        configured = database._normalize_database_url("postgresql+psycopg://db.example/team_manager")
+        self.assertEqual(fallback.drivername, "sqlite")
+        self.assertEqual(fallback.database, "./database.db")
+        self.assertEqual(configured.drivername, "postgresql+psycopg")
+
+    def test_all_model_tables_compile_for_postgresql(self):
+        expected = {
+            "utilisateurs", "projets", "workspaces", "workspace_memberships",
+            "messages_partage", "message_reads", "message_attachments", "tasks",
+            "notifications", "ai_usage", "password_reset_tokens",
+            "password_reset_attempts", "account_invitation_tokens", "schema_migrations",
+        }
+        self.assertEqual(set(database.Base.metadata.tables), expected)
+        statements = [
+            str(CreateTable(table).compile(dialect=postgresql.dialect()))
+            for table in database.Base.metadata.sorted_tables
+        ]
+        self.assertTrue(all("DATETIME" not in statement for statement in statements))
+
+    def test_idempotent_insert_and_super_admin_index_compile_for_both_dialects(self):
+        for dialect in (sqlite.dialect(), postgresql.dialect()):
+            connection = SimpleNamespace(dialect=dialect)
+            membership = database._insert_ignore_statement(
+                connection,
+                "workspace_memberships",
+                {"user_id": 7, "workspace_id": 3, "role": "MEMBRE", "can_manage_tasks": False},
+                ("user_id",),
+            )
+            sql = str(membership.compile(dialect=dialect))
+            self.assertIn("ON CONFLICT", sql)
+            self.assertIn("DO NOTHING", sql)
+            index_sql = database._super_admin_index_ddl(dialect)
+            self.assertIn("CREATE UNIQUE INDEX IF NOT EXISTS", index_sql)
+            self.assertIn("WHERE", index_sql)
+            self.assertIn("upper", index_sql.lower())
+            self.assertIn("SUPER_ADMIN", index_sql)
+
+    def test_postgresql_generated_ids_use_returning(self):
+        class Result:
+            def scalar_one(self):
+                return 41
+
+        class Connection:
+            dialect = postgresql.dialect()
+
+            def execute(self, statement):
+                self.sql = str(statement.compile(dialect=self.dialect))
+                return Result()
+
+        connection = Connection()
+        value = database._insert_id(
+            connection, "workspaces", {"name": "Test workspace", "owner_user_id": 41}
+        )
+        self.assertEqual(value, 41)
+        self.assertIn("RETURNING workspaces.id", connection.sql)
+
+    def test_postgresql_legacy_alter_types_are_compatible(self):
+        columns = database._legacy_column_definitions("postgresql")
+        self.assertEqual(columns["utilisateurs"]["password_changed_at"], "TIMESTAMP")
+        self.assertIn("BOOLEAN NOT NULL DEFAULT FALSE", columns["utilisateurs"]["password_bootstrapped"])
+        self.assertNotIn("DATETIME", str(columns))
+
+    def test_empty_sqlite_initialization_creates_all_tables_and_is_repeatable(self):
+        engine = create_engine("sqlite:///:memory:")
+        try:
+            database.initialize_database(engine)
+            database.initialize_database(engine)
+            with engine.connect() as connection:
+                inspector = __import__("sqlalchemy").inspect(connection)
+                self.assertEqual(set(database.Base.metadata.tables), set(inspector.get_table_names()))
+                revisions = connection.execute(text("SELECT COUNT(*) FROM schema_migrations")).scalar_one()
+                self.assertEqual(revisions, 3)
+                indexes = connection.execute(text(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                )).scalars().all()
+                self.assertIn("uq_utilisateurs_one_super_admin", indexes)
+        finally:
+            engine.dispose()
+
+    def test_duplicate_super_admins_fail_before_schema_or_role_changes(self):
+        engine = create_engine("sqlite:///:memory:")
+        try:
+            with engine.begin() as connection:
+                connection.execute(text(
+                    "CREATE TABLE utilisateurs (id INTEGER PRIMARY KEY, nom VARCHAR, "
+                    "email VARCHAR NOT NULL, hashed_password VARCHAR NOT NULL, role VARCHAR NOT NULL)"
+                ))
+                connection.execute(text(
+                    "INSERT INTO utilisateurs (id, nom, email, hashed_password, role) VALUES "
+                    "(1, 'A', 'a@example.test', 'hash-a', 'SUPER_ADMIN'), "
+                    "(2, 'B', 'b@example.test', 'hash-b', 'Super Admin')"
+                ))
+            with self.assertRaisesRegex(RuntimeError, "plusieurs comptes super-administrateur"):
+                database.initialize_database(engine)
+            with engine.connect() as connection:
+                roles = connection.execute(text("SELECT role FROM utilisateurs ORDER BY id")).scalars().all()
+                self.assertEqual(roles, ["SUPER_ADMIN", "Super Admin"])
+                self.assertNotIn("schema_migrations", __import__("sqlalchemy").inspect(connection).get_table_names())
+        finally:
+            engine.dispose()
 
 
 class WorkspaceMigrationTests(unittest.TestCase):

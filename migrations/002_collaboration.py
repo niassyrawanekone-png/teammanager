@@ -1,6 +1,6 @@
-"""Apply the additive collaboration schema migration.
+"""Run the shared additive collaboration schema initializer.
 
-Run from the backend directory after taking a database backup:
+Run from the backend directory after taking a verified database backup:
     python migrations/002_collaboration.py
 """
 import sys

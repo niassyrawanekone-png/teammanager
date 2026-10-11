@@ -1,8 +1,8 @@
-"""Apply the additive, repeatable 0001 workspace migration.
+"""Run the shared additive, repeatable workspace initializer.
 
 Run from the backend directory with the backend virtual environment:
     python migrations/001_workspaces.py
-Back up the SQLite database before running this command.
+Back up the configured SQLite or PostgreSQL database before running this command.
 """
 import sys
 from pathlib import Path

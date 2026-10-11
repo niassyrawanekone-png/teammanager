@@ -1,4 +1,4 @@
-"""Apply the repeatable single-super-admin SQLite constraint.
+"""Run the shared initializer, including the single-super-admin constraint.
 
 Back up the existing database before running this migration. It fails closed
 if the existing data contains more than one super-admin account.

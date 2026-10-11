@@ -7,22 +7,44 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
+    MetaData,
     String,
+    Table,
     Text,
     create_engine,
     event,
+    func,
     inspect,
     text,
 )
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+from sqlalchemy.schema import CreateIndex
 
 
-SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./database.db")
-_connect_args = {"check_same_thread": False} if SQLALCHEMY_DATABASE_URL.startswith("sqlite") else {}
+def _normalize_database_url(database_url):
+    """Use Psycopg 3 for Render's standard PostgreSQL URL schemes."""
+    url = make_url(database_url)
+    if url.drivername in {"postgres", "postgresql", "postgresql+psycopg2"}:
+        url = url.set(drivername="postgresql+psycopg")
+    return url
+
+
+SQLALCHEMY_DATABASE_URL = _normalize_database_url(
+    os.getenv("DATABASE_URL", "sqlite:///./database.db")
+)
+_connect_args = (
+    {"check_same_thread": False}
+    if SQLALCHEMY_DATABASE_URL.get_backend_name() == "sqlite"
+    else {}
+)
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args=_connect_args)
 
-if SQLALCHEMY_DATABASE_URL.startswith("sqlite"):
+if SQLALCHEMY_DATABASE_URL.get_backend_name() == "sqlite":
     @event.listens_for(engine, "connect")
     def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record):
         cursor = dbapi_connection.cursor()
@@ -212,6 +234,13 @@ class AccountInvitationTokenDB(Base):
     created_at = Column(DateTime, nullable=False)
 
 
+class SchemaMigrationDB(Base):
+    __tablename__ = "schema_migrations"
+
+    revision = Column(String, primary_key=True)
+    applied_at = Column(DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -237,42 +266,114 @@ def _canonical_role(role, email, super_admin_email):
     return "MEMBRE"
 
 
+def _insert_ignore_statement(connection, table_name, values, conflict_columns):
+    table = Base.metadata.tables[table_name]
+    index_elements = [table.c[column] for column in conflict_columns]
+    if connection.dialect.name == "sqlite":
+        return sqlite_insert(table).values(**values).on_conflict_do_nothing(
+            index_elements=index_elements
+        )
+    if connection.dialect.name == "postgresql":
+        return postgresql_insert(table).values(**values).on_conflict_do_nothing(
+            index_elements=index_elements
+        )
+    raise RuntimeError(f"Dialecte non pris en charge pour les insertions idempotentes: {connection.dialect.name}")
+
+
+def _insert_id(connection, table_name, values):
+    table = Base.metadata.tables[table_name]
+    statement = table.insert().values(**values)
+    if connection.dialect.name == "postgresql":
+        return connection.execute(statement.returning(table.c.id)).scalar_one()
+    result = connection.execute(statement)
+    return result.lastrowid
+
+
+def _assert_single_super_admin(users, super_email):
+    super_admin_count = sum(
+        _canonical_role(user["role"], user["email"], super_email) == "SUPER_ADMIN"
+        for user in users
+    )
+    if super_admin_count > 1:
+        raise RuntimeError(
+            "Initialisation interrompue : plusieurs comptes super-administrateur existent. "
+            "Aucun compte ni rôle n'a été modifié. Résolvez ce conflit après vérification humaine."
+        )
+
+
+def _super_admin_index_ddl(dialect):
+    index_table = Table("utilisateurs", MetaData(), Column("role", String))
+    normalized_role = func.upper(func.replace(func.trim(index_table.c.role), " ", "_"))
+    is_super_admin = normalized_role == "SUPER_ADMIN"
+    index = Index(
+        "uq_utilisateurs_one_super_admin",
+        normalized_role,
+        unique=True,
+        sqlite_where=is_super_admin,
+        postgresql_where=is_super_admin,
+    )
+    return str(CreateIndex(index, if_not_exists=True).compile(dialect=dialect))
+
+
+def _legacy_column_definitions(dialect_name):
+    timestamp = "TIMESTAMP" if dialect_name == "postgresql" else "DATETIME"
+    return {
+        "projets": {
+            "workspace_id": "INTEGER REFERENCES workspaces(id) ON DELETE CASCADE",
+            "owner_id": "INTEGER REFERENCES utilisateurs(id) ON DELETE RESTRICT",
+            "objectifs": "TEXT NOT NULL DEFAULT ''",
+            "resultats_attendus": "TEXT NOT NULL DEFAULT ''",
+        },
+        "messages_partage": {
+            "workspace_id": "INTEGER REFERENCES workspaces(id) ON DELETE CASCADE",
+            "project_id": "INTEGER REFERENCES projets(id) ON DELETE CASCADE",
+        },
+        "utilisateurs": {
+            "prenom": "VARCHAR",
+            "password_changed_at": timestamp,
+            "password_bootstrapped": "BOOLEAN NOT NULL DEFAULT FALSE",
+            "session_version": "INTEGER NOT NULL DEFAULT 0",
+        },
+    }
+
+
 def initialize_database(target_engine=engine):
-    """Create new tables and safely backfill legacy ownership without dropping rows."""
-    Base.metadata.create_all(bind=target_engine)
-    if target_engine.dialect.name != "sqlite":
-        raise RuntimeError("La migration initiale des espaces est prévue pour SQLite; utilisez Alembic pour un autre moteur.")
+    """Create missing tables and idempotently migrate legacy data on SQLite/PostgreSQL."""
+    dialect_name = target_engine.dialect.name
+    if dialect_name not in {"sqlite", "postgresql"}:
+        raise RuntimeError(f"Dialecte de base non pris en charge: {dialect_name}")
 
     super_email = os.getenv("SUPER_ADMIN_EMAIL", "").strip().lower()
     with target_engine.begin() as connection:
-        column_map = {
-            "projets": {
-                "workspace_id": "INTEGER REFERENCES workspaces(id) ON DELETE CASCADE",
-                "owner_id": "INTEGER REFERENCES utilisateurs(id) ON DELETE RESTRICT",
-                "objectifs": "TEXT NOT NULL DEFAULT ''",
-                "resultats_attendus": "TEXT NOT NULL DEFAULT ''",
-            },
-            "messages_partage": {
-                "workspace_id": "INTEGER REFERENCES workspaces(id) ON DELETE CASCADE",
-                "project_id": "INTEGER REFERENCES projets(id) ON DELETE CASCADE",
-            },
-            "utilisateurs": {
-                "prenom": "VARCHAR",
-                "password_changed_at": "DATETIME",
-                "password_bootstrapped": "BOOLEAN NOT NULL DEFAULT 0",
-                "session_version": "INTEGER NOT NULL DEFAULT 0",
-            },
-        }
+        existing_tables = set(inspect(connection).get_table_names())
+        if "utilisateurs" in existing_tables:
+            user_columns = {column["name"] for column in inspect(connection).get_columns("utilisateurs")}
+            if not {"email", "role"}.issubset(user_columns):
+                raise RuntimeError(
+                    "Initialisation interrompue : impossible de vérifier les super-administrateurs "
+                    "dans le schéma utilisateurs existant."
+                )
+            existing_users = connection.execute(
+                text("SELECT email, role FROM utilisateurs")
+            ).mappings().all()
+            _assert_single_super_admin(existing_users, super_email)
+
+        # create_all supplies missing tables only; the explicit compatibility/backfill
+        # steps below remain necessary for databases created by earlier app versions.
+        Base.metadata.create_all(bind=connection)
         inspector = inspect(connection)
-        for table, columns in column_map.items():
+        for table, columns in _legacy_column_definitions(dialect_name).items():
             existing = {item["name"] for item in inspector.get_columns(table)}
             for name, definition in columns.items():
                 if name not in existing:
-                    connection.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {definition}'))
-
-        connection.execute(text("CREATE TABLE IF NOT EXISTS schema_migrations (revision VARCHAR PRIMARY KEY, applied_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL)"))
+                    quoted_table = connection.dialect.identifier_preparer.quote(table)
+                    quoted_name = connection.dialect.identifier_preparer.quote(name)
+                    connection.execute(text(
+                        f"ALTER TABLE {quoted_table} ADD COLUMN {quoted_name} {definition}"
+                    ))
 
         users = connection.execute(text("SELECT id, nom, email, role FROM utilisateurs")).mappings().all()
+        _assert_single_super_admin(users, super_email)
         chefs = []
         for user in users:
             role = _canonical_role(user["role"], user["email"], super_email)
@@ -283,25 +384,24 @@ def initialize_database(target_engine=engine):
                     text("SELECT id FROM workspaces WHERE owner_user_id=:owner"), {"owner": user["id"]}
                 ).first()
                 if not existing:
-                    result = connection.execute(
-                        text("INSERT INTO workspaces (name, owner_user_id) VALUES (:name, :owner)"),
-                        {"name": f"Espace de {user['nom'] or user['email']}", "owner": user["id"]},
+                    workspace_id = _insert_id(
+                        connection,
+                        "workspaces",
+                        {"name": f"Espace de {user['nom'] or user['email']}", "owner_user_id": user["id"]},
                     )
-                    workspace_id = result.lastrowid
                 else:
                     workspace_id = existing[0]
-                connection.execute(
-                    text("INSERT OR IGNORE INTO workspace_memberships (user_id, workspace_id, role, can_manage_tasks) VALUES (:user, :workspace, 'CHEF_DE_PROJET', 1)"),
-                    {"user": user["id"], "workspace": workspace_id},
-                )
+                connection.execute(_insert_ignore_statement(
+                    connection,
+                    "workspace_memberships",
+                    {"user_id": user["id"], "workspace_id": workspace_id,
+                     "role": "CHEF_DE_PROJET", "can_manage_tasks": True},
+                    ("user_id",),
+                ))
 
         # Enforce the singleton owner invariant in SQLite as well as in the
         # login bootstrap path, including concurrent bootstrap attempts.
-        connection.execute(text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_utilisateurs_one_super_admin "
-            "ON utilisateurs ((1)) "
-            "WHERE upper(replace(trim(role), ' ', '_')) = 'SUPER_ADMIN'"
-        ))
+        connection.execute(text(_super_admin_index_ddl(connection.dialect)))
 
         workspaces = connection.execute(text("SELECT id, owner_user_id FROM workspaces")).all()
         # If the former creator account is the only historical project owner, retain
@@ -311,11 +411,12 @@ def initialize_database(target_engine=engine):
         non_super_users = [u for u in users if _canonical_role(u["role"], u["email"], super_email) != "SUPER_ADMIN"]
         legacy_project_count = connection.execute(text("SELECT COUNT(*) FROM projets")).scalar_one()
         if not workspaces and super_user and (non_super_users or legacy_project_count):
-            result = connection.execute(
-                text("INSERT INTO workspaces (name, owner_user_id) VALUES ('Espace historique', :owner)"),
-                {"owner": super_user["id"]},
+            historical_workspace_id = _insert_id(
+                connection,
+                "workspaces",
+                {"name": "Espace historique", "owner_user_id": super_user["id"]},
             )
-            workspaces = [(result.lastrowid, super_user["id"])]
+            workspaces = [(historical_workspace_id, super_user["id"])]
         workspace_by_owner = {owner: workspace_id for workspace_id, owner in workspaces}
         # Only infer old project ownership when its responsible matches a chef, or when
         # exactly one project workspace exists. Ambiguous records stay unassigned.
@@ -348,17 +449,20 @@ def initialize_database(target_engine=engine):
                 if historical:
                     historical_workspace_id = historical[0]
                 else:
-                    result = connection.execute(
-                        text("INSERT INTO workspaces (name, owner_user_id) VALUES ('Espace historique à attribuer', :owner)"),
-                        {"owner": super_user["id"]},
+                    historical_workspace_id = _insert_id(
+                        connection,
+                        "workspaces",
+                        {"name": "Espace historique à attribuer", "owner_user_id": super_user["id"]},
                     )
-                    historical_workspace_id = result.lastrowid
                 for user in orphan_users:
                     role = _canonical_role(user["role"], user["email"], super_email)
-                    connection.execute(
-                        text("INSERT OR IGNORE INTO workspace_memberships (user_id, workspace_id, role, can_manage_tasks) VALUES (:user, :workspace, :role, 0)"),
-                        {"user": user["id"], "workspace": historical_workspace_id, "role": role},
-                    )
+                    connection.execute(_insert_ignore_statement(
+                        connection,
+                        "workspace_memberships",
+                        {"user_id": user["id"], "workspace_id": historical_workspace_id,
+                         "role": role, "can_manage_tasks": False},
+                        ("user_id",),
+                    ))
                     connection.execute(
                         text("UPDATE messages_partage SET workspace_id=:workspace WHERE user_id=:user AND workspace_id IS NULL"),
                         {"workspace": historical_workspace_id, "user": user["id"]},
@@ -371,18 +475,22 @@ def initialize_database(target_engine=engine):
             for user in users:
                 role = _canonical_role(user["role"], user["email"], super_email)
                 if role != "SUPER_ADMIN":
-                    connection.execute(
-                        text("INSERT OR IGNORE INTO workspace_memberships (user_id, workspace_id, role, can_manage_tasks) VALUES (:user, :workspace, :role, 0)"),
-                        {"user": user["id"], "workspace": workspace_id, "role": role},
-                    )
+                    connection.execute(_insert_ignore_statement(
+                        connection,
+                        "workspace_memberships",
+                        {"user_id": user["id"], "workspace_id": workspace_id,
+                         "role": role, "can_manage_tasks": False},
+                        ("user_id",),
+                    ))
             connection.execute(
                 text("UPDATE messages_partage SET workspace_id=:workspace WHERE workspace_id IS NULL"),
                 {"workspace": workspace_id},
             )
 
-        connection.execute(text("INSERT OR IGNORE INTO schema_migrations (revision) VALUES ('0001_workspaces')"))
-        connection.execute(text("INSERT OR IGNORE INTO schema_migrations (revision) VALUES ('0002_collaboration')"))
-        connection.execute(text("INSERT OR IGNORE INTO schema_migrations (revision) VALUES ('0003_single_super_admin')"))
+        for revision in ("0001_workspaces", "0002_collaboration", "0003_single_super_admin"):
+            connection.execute(_insert_ignore_statement(
+                connection, "schema_migrations", {"revision": revision}, ("revision",)
+            ))
 
 
 if __name__ == "__main__":
