@@ -24,6 +24,12 @@ import main
 
 
 class DatabaseDialectTests(unittest.TestCase):
+    def test_production_frontend_is_allowed_even_when_render_cors_is_customized(self):
+        origins = main._allowed_cors_origins("https://custom.example")
+        self.assertIn("https://custom.example", origins)
+        self.assertIn("https://teammanager-frontend-rawaneproject.vercel.app", origins)
+        self.assertEqual(len(origins), len(set(origins)))
+
     def test_render_postgres_urls_select_psycopg_three(self):
         for value in (
             "postgres://db-user:placeholder@db.example/team_manager",

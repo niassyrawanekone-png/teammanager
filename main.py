@@ -255,10 +255,19 @@ def _validate_task_fields(data):
     return priority
 
 
+def _allowed_cors_origins(configured_origins=None):
+    configured = configured_origins
+    if configured is None:
+        configured = os.getenv(
+            "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+        )
+    origins = [origin.strip() for origin in configured.split(",") if origin.strip()]
+    origins.append("https://teammanager-frontend-rawaneproject.vercel.app")
+    return list(dict.fromkeys(origins))
+
+
 app = FastAPI(title="TeamManager API", version="2.0.0")
-allowed_origins = [origin.strip() for origin in os.getenv(
-    "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
-).split(",") if origin.strip()]
+allowed_origins = _allowed_cors_origins()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
