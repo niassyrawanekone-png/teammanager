@@ -116,11 +116,23 @@ class DatabaseDialectTests(unittest.TestCase):
                 inspector = __import__("sqlalchemy").inspect(connection)
                 self.assertEqual(set(database.Base.metadata.tables), set(inspector.get_table_names()))
                 revisions = connection.execute(text("SELECT COUNT(*) FROM schema_migrations")).scalar_one()
-                self.assertEqual(revisions, 3)
+                self.assertEqual(revisions, 4)
                 indexes = connection.execute(text(
                     "SELECT name FROM sqlite_master WHERE type='index'"
                 )).scalars().all()
                 self.assertIn("uq_utilisateurs_one_super_admin", indexes)
+        finally:
+            engine.dispose()
+
+    def test_attachment_column_is_added_to_existing_schema_idempotently(self):
+        engine = create_engine("sqlite:///:memory:")
+        try:
+            with engine.begin() as connection:
+                connection.execute(text("CREATE TABLE message_attachments (id INTEGER PRIMARY KEY)"))
+            database.initialize_database(engine)
+            database.initialize_database(engine)
+            columns = {column["name"] for column in __import__("sqlalchemy").inspect(engine).get_columns("message_attachments")}
+            self.assertIn("content_data", columns)
         finally:
             engine.dispose()
 
@@ -367,13 +379,15 @@ class WorkspaceMigrationTests(unittest.TestCase):
             file=BytesIO(b"\x1aE\xdf\xa3" + b"\x00" * 20), filename="recording.webm",
             headers=Headers({"content-type": "audio/webm;codecs=opus"}),
         )
-        with patch.object(main.storage, "upload_private_object") as upload_storage:
-            with patch.object(main.storage, "create_private_object_url", return_value="https://private.invalid/audio"):
-                result = asyncio.run(main.ajouter_audio_message(message.id, upload, self.db, member))
+        result = asyncio.run(main.ajouter_audio_message(message.id, upload, self.db, member))
         self.assertEqual(result["content_type"], "audio/webm")
-        self.assertTrue(result["url"].endswith("/audio"))
+        self.assertEqual(result["url"], f"/partage/attachments/{result['id']}")
         self.assertEqual(self.db.query(database.MessageAttachmentDB).filter_by(message_id=message.id).count(), 1)
-        upload_storage.assert_called_once()
+        attachment = self.db.get(database.MessageAttachmentDB, result["id"])
+        self.assertEqual(attachment.content_data, b"\x1aE\xdf\xa3" + b"\x00" * 20)
+        playback = main.lire_piece_jointe_partage(attachment.id, self.db, member)
+        self.assertEqual(playback.body, attachment.content_data)
+        self.assertEqual(playback.media_type, "audio/webm")
 
         outsider = main.inscrire(main.UtilisateurCreate(
             nom="Outside", email="audio-outsider@gmail.com", password="strong-password",
@@ -403,7 +417,27 @@ class WorkspaceMigrationTests(unittest.TestCase):
             asyncio.run(main.ajouter_audio_message(message.id, upload, self.db, member))
         self.assertEqual(denied.exception.status_code, 415)
 
-    def test_voice_attachment_does_not_report_success_when_storage_is_unavailable(self):
+    def test_photo_attachment_bytes_are_persisted_and_playable(self):
+        member = self.db.get(database.UtilisateurDB, 2)
+        membership = main.security.get_membership(self.db, member)
+        message = database.MessagePartageDB(
+            contenu="Photo", created_at=main._utc_now_naive(), user_id=member.id,
+            workspace_id=membership.workspace_id,
+        )
+        self.db.add(message)
+        self.db.commit()
+        image_bytes = b"\x89PNG\r\n\x1a\n"
+        upload = UploadFile(
+            file=BytesIO(image_bytes), filename="image.png",
+            headers=Headers({"content-type": "image/png"}),
+        )
+        result = asyncio.run(main.ajouter_photo_message(message.id, upload, self.db, member))
+        attachment = self.db.get(database.MessageAttachmentDB, result["id"])
+        self.assertEqual(attachment.content_data, image_bytes)
+        self.assertEqual(result["url"], f"/partage/attachments/{attachment.id}")
+        self.assertEqual(main.lire_piece_jointe_partage(attachment.id, self.db, member).body, image_bytes)
+
+    def test_voice_attachment_persists_without_s3_configuration(self):
         member = self.db.get(database.UtilisateurDB, 2)
         membership = main.security.get_membership(self.db, member)
         message = database.MessagePartageDB(
@@ -416,11 +450,32 @@ class WorkspaceMigrationTests(unittest.TestCase):
             file=BytesIO(b"\x1aE\xdf\xa3" + b"\x00" * 20), filename="recording.webm",
             headers=Headers({"content-type": "audio/webm"}),
         )
-        with patch.object(main.storage, "upload_private_object", side_effect=RuntimeError("storage unavailable")):
-            with self.assertRaises(HTTPException) as unavailable:
-                asyncio.run(main.ajouter_audio_message(message.id, upload, self.db, member))
-        self.assertEqual(unavailable.exception.status_code, 503)
-        self.assertEqual(self.db.query(database.MessageAttachmentDB).filter_by(message_id=message.id).count(), 0)
+        result = asyncio.run(main.ajouter_audio_message(message.id, upload, self.db, member))
+        self.assertEqual(result["content_type"], "audio/webm")
+        self.assertEqual(self.db.query(database.MessageAttachmentDB).filter_by(message_id=message.id).count(), 1)
+
+    def test_attachment_playback_is_workspace_scoped(self):
+        member = self.db.get(database.UtilisateurDB, 2)
+        membership = main.security.get_membership(self.db, member)
+        message = database.MessagePartageDB(
+            contenu="Photo", created_at=main._utc_now_naive(), user_id=member.id,
+            workspace_id=membership.workspace_id,
+        )
+        self.db.add(message)
+        self.db.flush()
+        attachment = database.MessageAttachmentDB(
+            message_id=message.id, object_key="postgresql://test", original_name="photo.png",
+            content_type="image/png", size_bytes=8, content_data=b"\x89PNG\r\n\x1a\n",
+            created_at=main._utc_now_naive(),
+        )
+        self.db.add(attachment)
+        self.db.commit()
+        outsider = main.inscrire(main.UtilisateurCreate(
+            nom="Outside", email="attachment-outsider@gmail.com", password="test-password-123",
+        ), self.db)
+        with self.assertRaises(HTTPException) as denied:
+            main.lire_piece_jointe_partage(attachment.id, self.db, outsider)
+        self.assertEqual(denied.exception.status_code, 404)
 
 
     def test_password_reset_is_hashed_single_use_and_revokes_old_sessions(self):

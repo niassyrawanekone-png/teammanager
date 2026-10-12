@@ -13,7 +13,7 @@ Configure these values in the backend hosting environment; do not commit secrets
 - `RESET_RATE_LIMIT_SECRET`: optional stable secret used to hash password-reset rate-limit keys; the JWT key is used when omitted.
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_USE_SSL`: outgoing email transport for password recovery and team invitations.
 - `APP_BASE_URL`: deployed frontend origin used to build invitation and reset links.
-- `STORAGE_S3_BUCKET`, `AWS_REGION`: private S3-compatible storage for discussion photos and voice messages. Supply AWS credentials through the hosting platform's IAM role or standard AWS credential provider; never put them in frontend variables.
+- `STORAGE_S3_BUCKET`, `AWS_REGION`: optional private S3-compatible storage used only to serve legacy discussion attachments. New discussion photos and voice messages are stored as binary data in `DATABASE_URL` PostgreSQL and served through authenticated API requests.
 - `AI_API_KEY`: optional server-only API key for the OpenAI-compatible chat endpoint. No key is configured in this repository, so the assistant returns an explicit unavailable response until configured.
 - `AI_CHAT_COMPLETIONS_URL`: optional OpenAI-compatible `/chat/completions` endpoint; defaults to the OpenAI API.
 - `AI_MODEL`: optional model name; defaults to `gpt-4o-mini`.
@@ -41,7 +41,7 @@ python migrations/002_collaboration.py
 python migrations/003_single_super_admin.py
 ```
 
-The scripts `001_workspaces.py`, `002_collaboration.py`, and `003_single_super_admin.py` all call the shared idempotent initializer. It records revisions `0001_workspaces`, `0002_collaboration`, and `0003_single_super_admin`. The initializer preserves existing user IDs, password hashes, project IDs, and messages; legacy role labels and workspace ownership are normalized/backfilled as part of the existing migration behavior. It checks for multiple super-administrator candidates before schema or account changes and aborts without changing roles or accounts if duplicates exist. The final expression-based unique index is compiled for SQLite or PostgreSQL. No database reset is used.
+The scripts `001_workspaces.py`, `002_collaboration.py`, and `003_single_super_admin.py` all call the shared idempotent initializer. It records revisions `0001_workspaces`, `0002_collaboration`, `0003_single_super_admin`, and `0004_database_attachments`. The initializer preserves existing user IDs, password hashes, project IDs, messages, and S3 attachment metadata; legacy role labels and workspace ownership are normalized/backfilled as part of the existing migration behavior. It adds a nullable binary column for new database-backed attachments without moving or deleting existing S3 objects. It checks for multiple super-administrator candidates before schema or account changes and aborts without changing roles or accounts if duplicates exist. The final expression-based unique index is compiled for SQLite or PostgreSQL. No database reset is used.
 
 Run the migration before deploying the new API code. The backend startup currently calls the same schema initializer, so starting the API also attempts this index creation. Do not start it against a production database until its backup is verified and the existing super-admin count has been checked.
 
@@ -55,7 +55,7 @@ The current hosted database configuration must use persistent storage. SQLite on
 
 Password recovery and invitations remain unavailable until the email variables and frontend base URL are configured and SMTP delivery is verified. The API returns a neutral password-recovery response either way. Team-member accounts are created only after the invitation email can be sent; recipients set their own password through the single-use, 48-hour activation link.
 
-Discussion photos are validated server-side (magic bytes and 5 MiB limit) and uploaded to private S3 storage. Voice messages accept validated WebM or Ogg audio containers up to 20 MiB and use the same private object store; the browser audio player exposes playback duration. Configure the bucket and IAM access before enabling media upload in production; signed download links expire after five minutes. These integrations have not been tested against a real bucket in this environment.
+Discussion photos are validated server-side (magic bytes and 5 MiB limit) and stored in PostgreSQL. Voice messages accept validated WebM or Ogg audio containers up to 20 MiB and are stored in PostgreSQL as well. Playback uses an authenticated, workspace-scoped endpoint; pre-existing S3-backed attachments continue to use private signed links. Back up PostgreSQL before deploying the additive attachment migration. The new upload path does not require an S3 bucket.
 
 The AI endpoint makes real requests to the configured provider and can incur API charges. A ChatGPT subscription does not include API usage. No request is made while `AI_API_KEY` is absent. Set a provider-side spending limit as well as the per-user request limit before enabling a paid API. Conversation history is stored in the user's browser; project context sent to the provider is limited to the selected project, and is subject to that provider's data policy.
 

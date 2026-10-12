@@ -9,6 +9,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     MetaData,
     String,
     Table,
@@ -154,6 +155,7 @@ class MessageAttachmentDB(Base):
     content_type = Column(String, nullable=False)
     size_bytes = Column(Integer, nullable=False)
     created_at = Column(DateTime, nullable=False)
+    content_data = Column(LargeBinary, nullable=True)
 
 
 class TaskDB(Base):
@@ -328,6 +330,9 @@ def _legacy_column_definitions(dialect_name):
             "workspace_id": "INTEGER REFERENCES workspaces(id) ON DELETE CASCADE",
             "project_id": "INTEGER REFERENCES projets(id) ON DELETE CASCADE",
         },
+        "message_attachments": {
+            "content_data": "BYTEA" if dialect_name == "postgresql" else "BLOB",
+        },
         "utilisateurs": {
             "prenom": "VARCHAR",
             "password_changed_at": timestamp,
@@ -487,7 +492,10 @@ def initialize_database(target_engine=engine):
                 {"workspace": workspace_id},
             )
 
-        for revision in ("0001_workspaces", "0002_collaboration", "0003_single_super_admin"):
+        for revision in (
+            "0001_workspaces", "0002_collaboration",
+            "0003_single_super_admin", "0004_database_attachments",
+        ):
             connection.execute(_insert_ignore_statement(
                 connection, "schema_migrations", {"revision": revision}, ("revision",)
             ))

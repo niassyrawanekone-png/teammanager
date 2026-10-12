@@ -1,4 +1,4 @@
-"""Run the shared additive collaboration schema initializer.
+"""Run the shared additive collaboration schema initializer and migrations.
 
 Run from the backend directory after taking a verified database backup:
     python migrations/002_collaboration.py
@@ -12,4 +12,4 @@ import database
 
 if __name__ == "__main__":
     database.initialize_database()
-    print("Migration 0002_collaboration applied (or already present).")
+    print("Collaboration migrations applied (or already present).")

@@ -12,7 +12,7 @@ from email.message import EmailMessage
 from typing import List, Optional
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
@@ -1188,10 +1188,13 @@ def _message_payload(db, msg):
     author = db.query(database.UtilisateurDB).filter(database.UtilisateurDB.id == msg.user_id).first()
     attachments = []
     for attachment in db.query(database.MessageAttachmentDB).filter_by(message_id=msg.id).all():
-        try:
-            url = storage.create_private_object_url(attachment.object_key)
-        except Exception:
-            url = None
+        if attachment.content_data is not None:
+            url = f"/partage/attachments/{attachment.id}"
+        else:
+            try:
+                url = storage.create_private_object_url(attachment.object_key)
+            except Exception:
+                url = None
         attachments.append({
             "id": attachment.id, "original_name": attachment.original_name,
             "content_type": attachment.content_type, "size_bytes": attachment.size_bytes,
@@ -1312,6 +1315,42 @@ def _detect_audio(data: bytes):
     return None, None
 
 
+def _attachment_message_for_user(db, attachment_id, current_user):
+    attachment = db.query(database.MessageAttachmentDB).filter_by(id=attachment_id).first()
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Pièce jointe introuvable.")
+    message = db.query(database.MessagePartageDB).filter_by(id=attachment.message_id).first()
+    if not message:
+        raise HTTPException(status_code=404, detail="Message introuvable.")
+    if not _is_super(current_user):
+        membership = _membership(db, current_user)
+        if message.workspace_id != membership.workspace_id or (
+            membership.project_id is not None
+            and message.project_id not in (None, membership.project_id)
+        ):
+            raise HTTPException(status_code=404, detail="Pièce jointe introuvable.")
+    return attachment
+
+
+@app.get("/partage/attachments/{attachment_id}")
+def lire_piece_jointe_partage(
+    attachment_id: int, db: Session = Depends(get_db),
+    current_user=Depends(security.get_current_user),
+):
+    attachment = _attachment_message_for_user(db, attachment_id, current_user)
+    if attachment.content_data is not None:
+        return Response(
+            content=attachment.content_data,
+            media_type=attachment.content_type,
+            headers={"Cache-Control": "private, no-store"},
+        )
+    try:
+        url = storage.create_private_object_url(attachment.object_key)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Le stockage privé de cette pièce jointe est indisponible.") from exc
+    return {"url": url}
+
+
 @app.post("/partage/{message_id}/photos", response_model=MessageAttachmentOut, status_code=status.HTTP_201_CREATED)
 async def ajouter_photo_message(message_id: int, file: UploadFile = File(...), db: Session = Depends(get_db), current_user=Depends(security.get_current_user)):
     membership = _membership(db, current_user)
@@ -1327,15 +1366,12 @@ async def ajouter_photo_message(message_id: int, file: UploadFile = File(...), d
     content_type, extension = _detect_image(data)
     if not content_type:
         raise HTTPException(status_code=415, detail="Formats acceptés : JPEG, PNG, GIF ou WebP.")
-    key = f"team-manager/{membership.workspace_id}/{message.id}/{secrets.token_hex(16)}{extension}"
-    try:
-        storage.upload_private_image(data, key, content_type)
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="Le stockage privé des images n'est pas disponible.") from exc
+    key = f"postgresql://{membership.workspace_id}/{message.id}/{secrets.token_hex(16)}{extension}"
     original_name = os.path.basename(file.filename or f"photo{extension}")[:180]
     attachment = database.MessageAttachmentDB(
         message_id=message.id, object_key=key, original_name=original_name,
         content_type=content_type, size_bytes=len(data), created_at=_utc_now_naive(),
+        content_data=data,
     )
     db.add(attachment)
     try:
@@ -1343,15 +1379,8 @@ async def ajouter_photo_message(message_id: int, file: UploadFile = File(...), d
         db.refresh(attachment)
     except Exception:
         db.rollback()
-        try:
-            storage.delete_private_image(key)
-        except Exception:
-            logging.getLogger(__name__).warning("Could not remove an orphaned private image.")
-        raise HTTPException(status_code=500, detail="Impossible d'enregistrer les métadonnées de l'image.")
-    try:
-        url = storage.create_private_image_url(key)
-    except Exception:
-        url = None
+        raise HTTPException(status_code=500, detail="Impossible d'enregistrer l'image dans la base de données.")
+    url = f"/partage/attachments/{attachment.id}"
     return {"id": attachment.id, "original_name": attachment.original_name,
             "content_type": attachment.content_type, "size_bytes": attachment.size_bytes, "url": url}
 
@@ -1372,14 +1401,11 @@ async def ajouter_audio_message(message_id: int, file: UploadFile = File(...), d
     declared_type = (file.content_type or "").split(";", 1)[0].strip().lower()
     if not content_type or declared_type != content_type:
         raise HTTPException(status_code=415, detail="Formats acceptés : audio WebM ou Ogg valide.")
-    key = f"team-manager/{membership.workspace_id}/{message.id}/{secrets.token_hex(16)}{extension}"
-    try:
-        storage.upload_private_object(data, key, content_type)
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="Le stockage privé des messages vocaux n'est pas disponible.") from exc
+    key = f"postgresql://{membership.workspace_id}/{message.id}/{secrets.token_hex(16)}{extension}"
     attachment = database.MessageAttachmentDB(
         message_id=message.id, object_key=key, original_name=f"message-vocal{extension}",
         content_type=content_type, size_bytes=len(data), created_at=_utc_now_naive(),
+        content_data=data,
     )
     db.add(attachment)
     try:
@@ -1387,15 +1413,8 @@ async def ajouter_audio_message(message_id: int, file: UploadFile = File(...), d
         db.refresh(attachment)
     except Exception:
         db.rollback()
-        try:
-            storage.delete_private_object(key)
-        except Exception:
-            logging.getLogger(__name__).warning("Could not remove an orphaned private voice message.")
-        raise HTTPException(status_code=500, detail="Impossible d'enregistrer les métadonnées du message vocal.")
-    try:
-        url = storage.create_private_object_url(key)
-    except Exception:
-        url = None
+        raise HTTPException(status_code=500, detail="Impossible d'enregistrer le message vocal dans la base de données.")
+    url = f"/partage/attachments/{attachment.id}"
     return {"id": attachment.id, "original_name": attachment.original_name,
             "content_type": attachment.content_type, "size_bytes": attachment.size_bytes, "url": url}
 
@@ -1413,10 +1432,11 @@ def supprimer_message_partage(message_id: int, db: Session = Depends(get_db), cu
             raise HTTPException(status_code=404, detail="Message introuvable.")
     attachments = db.query(database.MessageAttachmentDB).filter_by(message_id=message.id).all()
     for attachment in attachments:
-        try:
-            storage.delete_private_image(attachment.object_key)
-        except Exception as exc:
-            raise HTTPException(status_code=503, detail="Impossible de supprimer le fichier privé.") from exc
+        if attachment.content_data is None:
+            try:
+                storage.delete_private_image(attachment.object_key)
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail="Impossible de supprimer le fichier privé.") from exc
         db.delete(attachment)
     db.delete(message)
     db.commit()
