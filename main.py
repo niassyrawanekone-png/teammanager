@@ -5,10 +5,12 @@ import hmac
 import logging
 import smtplib
 import json
+import base64
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
+from email.utils import parseaddr
 from typing import List, Optional
 from urllib.parse import quote
 
@@ -88,6 +90,10 @@ class AdminWorkspaceUpdate(BaseModel):
 class AdminMemberRoleUpdate(BaseModel):
     role: str
     can_manage_tasks: bool = False
+
+
+class AdminUserDelete(BaseModel):
+    delete_workspace: bool = False
 
 
 class ProjetCreate(BaseModel):
@@ -365,38 +371,38 @@ def _fingerprint(value, secret):
 def _utc_now_naive():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
+def _email_transport_configured():
+    return bool(os.getenv("SMTP_FROM")) and bool(os.getenv("APP_BASE_URL")) and bool(os.getenv("RESEND_API_KEY"))
+
 
 def _send_configured_email(email, subject, content):
-    required = ("SMTP_HOST", "SMTP_FROM", "APP_BASE_URL")
-    if not all(os.getenv(name) for name in required):
+    if not _email_transport_configured():
         return False
-    message = EmailMessage()
-    message["Subject"] = subject
-    message["From"] = os.environ["SMTP_FROM"]
-    message["To"] = email
-    message.set_content(content)
-    try:
-        host = os.environ["SMTP_HOST"]
-        port = int(os.getenv("SMTP_PORT", "587"))
-        username = os.getenv("SMTP_USERNAME")
-        password = os.getenv("SMTP_PASSWORD")
-        use_ssl = os.getenv("SMTP_USE_SSL", "false").lower() == "true"
-        if use_ssl:
-            with smtplib.SMTP_SSL(host, port, timeout=15) as smtp:
-                if username:
-                    smtp.login(username, password or "")
-                smtp.send_message(message)
-        else:
-            with smtplib.SMTP(host, port, timeout=15) as smtp:
-                smtp.starttls()
-                if username:
-                    smtp.login(username, password or "")
-                smtp.send_message(message)
-        return True
-    except Exception:
-        logging.getLogger(__name__).warning("Transactional email delivery failed.")
-        return False
+    
+    api_key = os.getenv("RESEND_API_KEY")
+    sender_email = os.getenv("SMTP_FROM", "onboarding@resend.dev")
 
+    payload = {
+        "from": sender_email,
+        "to": [email],
+        "subject": subject,
+        "text": content,
+    }
+    request = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return response.status == 200
+    except Exception:
+        logging.getLogger(__name__).warning("Resend email delivery failed.")
+        return False
 
 def _email_reset_token(email, token):
     link = f"{os.getenv('APP_BASE_URL', '').rstrip('/')}/reinitialiser-mot-de-passe?token={quote(token)}"
@@ -556,7 +562,7 @@ def demander_reinitialisation(data: PasswordResetRequest, request: Request, db: 
         db.commit()
         return _reset_response()
     user = db.query(database.UtilisateurDB).filter(database.UtilisateurDB.email == email_clean).first()
-    mail_configured = all(os.getenv(name) for name in ("SMTP_HOST", "SMTP_FROM", "APP_BASE_URL"))
+    mail_configured = _email_transport_configured()
     if user and mail_configured:
         token = secrets.token_urlsafe(48)
         now = _utc_now_naive()
@@ -679,6 +685,59 @@ def administrer_liste_utilisateurs(db: Session = Depends(get_db), current_user=D
     _require_super_admin(current_user)
     users = db.query(database.UtilisateurDB).order_by(database.UtilisateurDB.id).all()
     return [_user_out(db, user) for user in users]
+
+
+@app.delete("/admin/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def administrer_supprimer_utilisateur(
+    user_id: int, data: AdminUserDelete, db: Session = Depends(get_db),
+    current_user=Depends(security.get_current_user),
+):
+    _require_super_admin(current_user)
+    target = db.query(database.UtilisateurDB).filter_by(id=user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Compte introuvable.")
+    if _is_super(target):
+        raise HTTPException(status_code=409, detail="Le compte super administrateur ne peut pas être supprimé ici.")
+
+    workspace = db.query(database.WorkspaceDB).filter_by(owner_user_id=target.id).first()
+    if workspace:
+        if not data.delete_workspace:
+            raise HTTPException(
+                status_code=409,
+                detail="Ce compte possède un espace. Confirmez la suppression de cet espace et de ses données.",
+            )
+        other_members = db.query(database.WorkspaceMembershipDB).filter(
+            database.WorkspaceMembershipDB.workspace_id == workspace.id,
+            database.WorkspaceMembershipDB.user_id != target.id,
+        ).count()
+        if other_members:
+            raise HTTPException(
+                status_code=409,
+                detail="L'espace contient d'autres comptes. Transférez sa propriété ou retirez ses membres avant suppression.",
+            )
+        messages = db.query(database.MessagePartageDB).filter_by(workspace_id=workspace.id).all()
+        for message in messages:
+            attachments = db.query(database.MessageAttachmentDB).filter_by(message_id=message.id).all()
+            for attachment in attachments:
+                if attachment.content_data is None:
+                    try:
+                        storage.delete_private_image(attachment.object_key)
+                    except Exception as exc:
+                        raise HTTPException(status_code=503, detail="Impossible de supprimer un fichier privé.") from exc
+                db.delete(attachment)
+            db.delete(message)
+        db.query(database.TaskDB).filter_by(workspace_id=workspace.id).delete(synchronize_session=False)
+        db.query(database.ProjetDB).filter_by(workspace_id=workspace.id).delete(synchronize_session=False)
+        db.query(database.NotificationDB).filter_by(workspace_id=workspace.id).delete(synchronize_session=False)
+        db.query(database.WorkspaceMembershipDB).filter_by(workspace_id=workspace.id).delete(synchronize_session=False)
+        db.delete(workspace)
+        db.flush()
+    elif data.delete_workspace:
+        raise HTTPException(status_code=422, detail="Ce compte ne possède aucun espace à supprimer.")
+
+    db.delete(target)
+    db.commit()
+    return None
 
 
 @app.get("/admin/workspaces")
@@ -831,7 +890,7 @@ def ajouter_utilisateur(user: UtilisateurCreate, db: Session = Depends(get_db), 
     nom = user.nom.strip()
     if not prenom:
         raise HTTPException(status_code=422, detail="Le prénom est obligatoire pour inviter un membre.")
-    if not all(os.getenv(name) for name in ("SMTP_HOST", "SMTP_FROM", "APP_BASE_URL")):
+    if not _email_transport_configured():
         raise HTTPException(status_code=503, detail="Les invitations par e-mail ne sont pas configurées.")
     if db.query(database.UtilisateurDB).filter(database.UtilisateurDB.email == email_clean).first():
         raise HTTPException(status_code=409, detail="Cet e-mail est déjà associé à un compte.")
@@ -1321,6 +1380,8 @@ def _detect_audio(data: bytes):
         return "audio/webm", ".webm"
     if data.startswith(b"OggS"):
         return "audio/ogg", ".ogg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "audio/wav", ".wav"
     return None, None
 
 
@@ -1409,7 +1470,7 @@ async def ajouter_audio_message(message_id: int, file: UploadFile = File(...), d
     content_type, extension = _detect_audio(data)
     declared_type = (file.content_type or "").split(";", 1)[0].strip().lower()
     if not content_type or declared_type != content_type:
-        raise HTTPException(status_code=415, detail="Formats acceptés : audio WebM ou Ogg valide.")
+        raise HTTPException(status_code=415, detail="Formats acceptés : audio WebM, Ogg ou WAV valide.")
     key = f"postgresql://{membership.workspace_id}/{message.id}/{secrets.token_hex(16)}{extension}"
     attachment = database.MessageAttachmentDB(
         message_id=message.id, object_key=key, original_name=f"message-vocal{extension}",
@@ -1433,12 +1494,14 @@ def supprimer_message_partage(message_id: int, db: Session = Depends(get_db), cu
     message = db.query(database.MessagePartageDB).filter(database.MessagePartageDB.id == message_id).first()
     if not message:
         raise HTTPException(status_code=404, detail="Message introuvable.")
-    if not _is_super(current_user) and message.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Vous ne pouvez supprimer que vos propres messages.")
     if not _is_super(current_user):
         membership = _membership(db, current_user)
         if message.workspace_id != membership.workspace_id:
             raise HTTPException(status_code=404, detail="Message introuvable.")
+        if membership.project_id is not None and message.project_id not in (None, membership.project_id):
+            raise HTTPException(status_code=404, detail="Message introuvable.")
+        if message.user_id != current_user.id and membership.role != "CHEF_DE_PROJET":
+            raise HTTPException(status_code=403, detail="Vous ne pouvez supprimer que vos propres messages.")
     attachments = db.query(database.MessageAttachmentDB).filter_by(message_id=message.id).all()
     for attachment in attachments:
         if attachment.content_data is None:
