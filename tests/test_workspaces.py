@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import unittest
 import asyncio
@@ -592,6 +592,37 @@ class WorkspaceMigrationTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as denied:
             asyncio.run(main.ajouter_audio_message(message.id, upload, self.db, member))
         self.assertEqual(denied.exception.status_code, 415)
+
+    def test_wav_voice_attachment_is_saved_and_served(self):
+        member = self.db.get(database.UtilisateurDB, 2)
+        membership = main.security.get_membership(self.db, member)
+        message = database.MessagePartageDB(
+            contenu="Message vocal WAV", created_at=main._utc_now_naive(), user_id=member.id,
+            workspace_id=membership.workspace_id,
+        )
+        self.db.add(message)
+        self.db.commit()
+        audio = BytesIO()
+        with wave.open(audio, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(b"\x00\x00" * 160)
+        audio_bytes = audio.getvalue()
+        upload = UploadFile(
+            file=BytesIO(audio_bytes), filename="recording.wav",
+            headers=Headers({"content-type": "audio/wav"}),
+        )
+
+        result = asyncio.run(main.ajouter_audio_message(message.id, upload, self.db, member))
+
+        self.assertEqual(result["content_type"], "audio/wav")
+        self.assertTrue(result["original_name"].endswith(".wav"))
+        attachment = self.db.get(database.MessageAttachmentDB, result["id"])
+        self.assertEqual(attachment.content_data, audio_bytes)
+        playback = main.lire_piece_jointe_partage(attachment.id, self.db, member)
+        self.assertEqual(playback.body, audio_bytes)
+        self.assertEqual(playback.media_type, "audio/wav")
 
     def test_wav_voice_attachment_is_saved_and_served(self):
         member = self.db.get(database.UtilisateurDB, 2)
