@@ -2,6 +2,8 @@
 import sys
 import unittest
 import asyncio
+import json
+import wave
 from io import BytesIO
 from types import SimpleNamespace
 
@@ -16,7 +18,7 @@ from sqlalchemy.schema import CreateTable
 from fastapi import HTTPException
 from starlette.datastructures import Headers, UploadFile
 from starlette.requests import Request
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from scripts.recover_super_admin import recover_super_admin_password
 
 import database
@@ -165,6 +167,74 @@ class DatabaseDialectTests(unittest.TestCase):
             engine.dispose()
 
 
+class TransactionalEmailTests(unittest.TestCase):
+    def setUp(self):
+        self.original_env = {
+            key: os.environ.get(key)
+            for key in (
+                "SMTP_FROM", "APP_BASE_URL", "SMTP_HOST", "MAILJET_API_KEY",
+                "MAILJET_API_SECRET",
+            )
+        }
+        for key in self.original_env:
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        for key, value in self.original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def test_mailjet_api_configuration_enables_transactional_email(self):
+        os.environ["SMTP_FROM"] = "Team Manager <verified@example.com>"
+        os.environ["APP_BASE_URL"] = "https://team.example.com"
+        os.environ["MAILJET_API_KEY"] = "public-test-key"
+        os.environ["MAILJET_API_SECRET"] = "private-test-secret"
+        self.assertTrue(main._email_transport_configured())
+
+    def test_mailjet_api_sends_transactional_plain_text_message(self):
+        os.environ["SMTP_FROM"] = "Team Manager <verified@example.com>"
+        os.environ["APP_BASE_URL"] = "https://team.example.com"
+        os.environ["MAILJET_API_KEY"] = "public-test-key"
+        os.environ["MAILJET_API_SECRET"] = "private-test-secret"
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"Messages":[{"Status":"success"}]}'
+
+        with patch.object(main.urllib.request, "urlopen", return_value=response) as send:
+            result = main._send_configured_email(
+                "recipient@example.com", "Invitation", "Use this link."
+            )
+
+        self.assertTrue(result)
+        request = send.call_args.args[0]
+        self.assertEqual(request.full_url, "https://api.mailjet.com/v3.1/send")
+        self.assertEqual(request.get_method(), "POST")
+        payload = json.loads(request.data)
+        message = payload["Messages"][0]
+        self.assertEqual(message["From"], {
+            "Email": "verified@example.com", "Name": "Team Manager",
+        })
+        self.assertEqual(message["To"], [{"Email": "recipient@example.com"}])
+        self.assertEqual(message["Subject"], "Invitation")
+        self.assertEqual(message["TextPart"], "Use this link.")
+        self.assertTrue(request.get_header("Authorization").startswith("Basic "))
+
+    def test_mailjet_api_rejection_is_reported_as_failed_delivery(self):
+        os.environ["SMTP_FROM"] = "Team Manager <verified@example.com>"
+        os.environ["APP_BASE_URL"] = "https://team.example.com"
+        os.environ["MAILJET_API_KEY"] = "public-test-key"
+        os.environ["MAILJET_API_SECRET"] = "private-test-secret"
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"Messages":[{"Status":"error"}]}'
+        with patch.object(main.urllib.request, "urlopen", return_value=response):
+            self.assertFalse(main._send_configured_email(
+                "recipient@example.com", "Invitation", "Use this link."
+            ))
+
+
 class WorkspaceMigrationTests(unittest.TestCase):
     def setUp(self):
         os.environ["SUPER_ADMIN_EMAIL"] = "owner@gmail.com"
@@ -288,6 +358,65 @@ class WorkspaceMigrationTests(unittest.TestCase):
         self.assertEqual(denied_workspace.exception.status_code, 403)
         self.assertEqual(self.db.query(database.WorkspaceDB).count(), 1)
 
+    def test_super_admin_account_deletion_requires_and_cleans_owned_workspace(self):
+        super_admin = database.UtilisateurDB(
+            nom="Global", email="super-owner@gmail.com", role="SUPER_ADMIN",
+            hashed_password="hash",
+        )
+        self.db.add(super_admin)
+        self.db.commit()
+        owner = self.db.get(database.UtilisateurDB, 1)
+        member = self.db.get(database.UtilisateurDB, 2)
+        workspace = self.db.query(database.WorkspaceDB).filter_by(owner_user_id=owner.id).one()
+        project = self.db.query(database.ProjetDB).filter_by(workspace_id=workspace.id).one()
+        message = self.db.query(database.MessagePartageDB).filter_by(workspace_id=workspace.id).one()
+        workspace_id, project_id, message_id = workspace.id, project.id, message.id
+        attachment = database.MessageAttachmentDB(
+            message_id=message.id, object_key="test/audio.wav", original_name="audio.wav",
+            content_type="audio/wav", size_bytes=46, created_at=main._utc_now_naive(),
+            content_data=b"RIFF",
+        )
+        task = database.TaskDB(
+            workspace_id=workspace.id, project_id=project.id, title="Task",
+            description="", priority="NORMAL", status="TODO",
+            created_at=main._utc_now_naive(), updated_at=main._utc_now_naive(),
+        )
+        self.db.add_all([attachment, task])
+        self.db.commit()
+        owner_id, member_id = owner.id, member.id
+        attachment_id, task_id = attachment.id, task.id
+
+        with self.assertRaises(HTTPException) as missing_confirmation:
+            main.administrer_supprimer_utilisateur(
+                owner.id, main.AdminUserDelete(), self.db, super_admin,
+            )
+        self.assertEqual(missing_confirmation.exception.status_code, 409)
+        with self.assertRaises(HTTPException) as other_members:
+            main.administrer_supprimer_utilisateur(
+                owner.id, main.AdminUserDelete(delete_workspace=True), self.db, super_admin,
+            )
+        self.assertEqual(other_members.exception.status_code, 409)
+        with self.assertRaises(HTTPException) as protected_admin:
+            main.administrer_supprimer_utilisateur(
+                super_admin.id, main.AdminUserDelete(delete_workspace=True), self.db, super_admin,
+            )
+        self.assertEqual(protected_admin.exception.status_code, 409)
+
+        self.db.delete(main.security.get_membership(self.db, member))
+        self.db.commit()
+        main.administrer_supprimer_utilisateur(
+            owner.id, main.AdminUserDelete(delete_workspace=True), self.db, super_admin,
+        )
+
+        self.db.expire_all()
+        self.assertIsNone(self.db.get(database.UtilisateurDB, owner_id))
+        self.assertIsNone(self.db.get(database.WorkspaceDB, workspace_id))
+        self.assertIsNone(self.db.get(database.ProjetDB, project_id))
+        self.assertIsNone(self.db.get(database.MessagePartageDB, message_id))
+        self.assertIsNone(self.db.get(database.MessageAttachmentDB, attachment_id))
+        self.assertIsNone(self.db.get(database.TaskDB, task_id))
+        self.assertIsNotNone(self.db.get(database.UtilisateurDB, member_id))
+
     def test_super_admin_can_transfer_workspace_owner_without_crossing_workspaces(self):
         owner = database.UtilisateurDB(
             nom="Global", email="owner@gmail.com", role="SUPER_ADMIN", hashed_password="hash",
@@ -372,6 +501,47 @@ class WorkspaceMigrationTests(unittest.TestCase):
         self.assertEqual(denied_delete.exception.status_code, 403)
         self.assertIsNotNone(self.db.get(database.UtilisateurDB, owner.id))
 
+    def test_message_deletion_permissions_follow_workspace_roles(self):
+        lead = self.db.get(database.UtilisateurDB, 1)
+        member = self.db.get(database.UtilisateurDB, 2)
+        workspace_id = main.security.get_membership(self.db, lead).workspace_id
+        member_message = database.MessagePartageDB(
+            contenu="Member message", created_at=main._utc_now_naive(), user_id=member.id,
+            workspace_id=workspace_id,
+        )
+        lead_message = database.MessagePartageDB(
+            contenu="Lead message", created_at=main._utc_now_naive(), user_id=lead.id,
+            workspace_id=workspace_id,
+        )
+        self.db.add_all([member_message, lead_message])
+        self.db.commit()
+
+        with self.assertRaises(HTTPException) as denied:
+            main.supprimer_message_partage(lead_message.id, self.db, member)
+        self.assertEqual(denied.exception.status_code, 403)
+        self.assertIsNotNone(self.db.get(database.MessagePartageDB, lead_message.id))
+
+        self.assertIsNone(main.supprimer_message_partage(member_message.id, self.db, member))
+        self.assertIsNone(self.db.get(database.MessagePartageDB, member_message.id))
+
+        team_message = database.MessagePartageDB(
+            contenu="Team message", created_at=main._utc_now_naive(), user_id=member.id,
+            workspace_id=workspace_id,
+        )
+        self.db.add(team_message)
+        self.db.commit()
+        self.assertIsNone(main.supprimer_message_partage(team_message.id, self.db, lead))
+        self.assertIsNone(self.db.get(database.MessagePartageDB, team_message.id))
+
+        super_admin = database.UtilisateurDB(
+            nom="Global", email="super-owner@gmail.com", role="SUPER_ADMIN",
+            hashed_password="hash",
+        )
+        self.db.add(super_admin)
+        self.db.commit()
+        self.assertIsNone(main.supprimer_message_partage(lead_message.id, self.db, super_admin))
+        self.assertIsNone(self.db.get(database.MessagePartageDB, lead_message.id))
+
     def test_voice_attachment_is_private_validated_and_workspace_scoped(self):
         member = self.db.get(database.UtilisateurDB, 2)
         membership = main.security.get_membership(self.db, member)
@@ -422,6 +592,37 @@ class WorkspaceMigrationTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as denied:
             asyncio.run(main.ajouter_audio_message(message.id, upload, self.db, member))
         self.assertEqual(denied.exception.status_code, 415)
+
+    def test_wav_voice_attachment_is_saved_and_served(self):
+        member = self.db.get(database.UtilisateurDB, 2)
+        membership = main.security.get_membership(self.db, member)
+        message = database.MessagePartageDB(
+            contenu="Message vocal WAV", created_at=main._utc_now_naive(), user_id=member.id,
+            workspace_id=membership.workspace_id,
+        )
+        self.db.add(message)
+        self.db.commit()
+        audio = BytesIO()
+        with wave.open(audio, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(b"\x00\x00" * 160)
+        audio_bytes = audio.getvalue()
+        upload = UploadFile(
+            file=BytesIO(audio_bytes), filename="recording.wav",
+            headers=Headers({"content-type": "audio/wav"}),
+        )
+
+        result = asyncio.run(main.ajouter_audio_message(message.id, upload, self.db, member))
+
+        self.assertEqual(result["content_type"], "audio/wav")
+        self.assertTrue(result["original_name"].endswith(".wav"))
+        attachment = self.db.get(database.MessageAttachmentDB, result["id"])
+        self.assertEqual(attachment.content_data, audio_bytes)
+        playback = main.lire_piece_jointe_partage(attachment.id, self.db, member)
+        self.assertEqual(playback.body, audio_bytes)
+        self.assertEqual(playback.media_type, "audio/wav")
 
     def test_photo_attachment_bytes_are_persisted_and_playable(self):
         member = self.db.get(database.UtilisateurDB, 2)

@@ -11,7 +11,8 @@ Configure these values in the backend hosting environment; do not commit secrets
 - `CORS_ORIGINS`: comma-separated exact frontend origins, including the deployed Vercel URL.
 - `SUPER_ADMIN_NAME`: optional display name used only if the configured owner account is missing during first bootstrap.
 - `RESET_RATE_LIMIT_SECRET`: optional stable secret used to hash password-reset rate-limit keys; the JWT key is used when omitted.
-- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_USE_SSL`: outgoing email transport for password recovery and team invitations.
+- `MAILJET_API_KEY`, `MAILJET_API_SECRET`, `SMTP_FROM`: optional Mailjet Send API credentials for password recovery and team invitations. The sender address in `SMTP_FROM` must be validated and active in Mailjet. This HTTPS transport works with Render Free, which blocks outbound connections on common SMTP ports.
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_USE_SSL`: optional SMTP transport for hosting environments that permit the configured SMTP port. Mailjet API credentials take precedence when both transports are configured.
 - `APP_BASE_URL`: deployed frontend origin used to build invitation and reset links.
 - `STORAGE_S3_BUCKET`, `AWS_REGION`: optional private S3-compatible storage used only to serve legacy discussion attachments. New discussion photos and voice messages are stored as binary data in `DATABASE_URL` PostgreSQL and served through authenticated API requests.
 - `AI_API_KEY`: optional server-only API key for the OpenAI-compatible chat endpoint. No key is configured in this repository, so the assistant returns an explicit unavailable response until configured.
@@ -24,6 +25,12 @@ The configured one-time bootstrap is disabled as soon as any super-administrator
 ### Owner account recovery
 
 There is no public HTTP endpoint for owner recovery. A server operator with authorized database access can rotate the password using `python scripts/recover_super_admin.py`. First stop application writes and take a verified backup of the configured database. Run the script in the backend environment with the same `DATABASE_URL`; it prompts for the new password without echoing it, requires exactly one `SUPER_ADMIN` row, updates only that row's password hash, and increments its session version to revoke existing tokens. It does not create accounts or change roles. Never pass the password as an argument or place it in logs. Restart the service after confirming the backup and script result.
+
+### Confirmed production data reset
+
+To clear production application data while retaining one existing super-administrator, use `python scripts/purge_production_data.py` from an authorized local machine. First confirm that a restorable PostgreSQL backup exists and pause the web service so new sign-ups or writes cannot race with the reset. Keep it paused until the script's post-commit check succeeds. The script asks for the PostgreSQL URL with input hidden, then asks for the exact email of the account to preserve. It refuses to continue unless that account exists exactly once with role `SUPER_ADMIN` and is the only super-administrator. It displays a row-count preview and requires the exact confirmation `PURGER PRODUCTION`.
+
+The purge locks the reflected application tables, deletes dependent rows before their foreign-key parents, retains the `schema_migrations` and `alembic_version` tables, and verifies that only the specified administrator and schema history remain before committing. A failed precondition or verification rolls the transaction back. Never put the database URL in a command argument, environment file committed to Git, or chat. The process prints no database URL.
 
 ## Workspace migration
 
@@ -55,7 +62,9 @@ The current hosted database configuration must use persistent storage. SQLite on
 
 Password recovery and invitations remain unavailable until the email variables and frontend base URL are configured and SMTP delivery is verified. The API returns a neutral password-recovery response either way. Team-member accounts are created only after the invitation email can be sent; recipients set their own password through the single-use, 48-hour activation link.
 
-Discussion photos are validated server-side (magic bytes and 5 MiB limit) and stored in PostgreSQL. Voice messages accept validated WebM or Ogg audio containers up to 20 MiB and are stored in PostgreSQL as well. Playback uses an authenticated, workspace-scoped endpoint; pre-existing S3-backed attachments continue to use private signed links. Back up PostgreSQL before deploying the additive attachment migration. The new upload path does not require an S3 bucket.
+Discussion photos are validated server-side (magic bytes and 5 MiB limit) and stored in PostgreSQL. Voice messages accept validated WebM, Ogg, or WAV audio containers up to 20 MiB and are stored in PostgreSQL as well. New browser recordings use 16 kHz mono PCM WAV for consistent playback. Playback uses an authenticated, workspace-scoped endpoint; pre-existing S3-backed attachments continue to use private signed links. Back up PostgreSQL before deploying the additive attachment migration. The new upload path does not require an S3 bucket.
+
+Super-admins may delete ordinary accounts from global administration. Deleting a workspace owner requires explicit confirmation and removes that owner's workspace data, including projects, tasks, discussion messages, attachments, and notifications. An owned workspace with other members cannot be removed until they are handled.
 
 The AI endpoint makes real requests to the configured provider and can incur API charges. A ChatGPT subscription does not include API usage. No request is made while `AI_API_KEY` is absent. Set a provider-side spending limit as well as the per-user request limit before enabling a paid API. Conversation history is stored in the user's browser; project context sent to the provider is limited to the selected project, and is subject to that provider's data policy.
 
